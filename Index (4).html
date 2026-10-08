@@ -1,0 +1,180 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+contract ApexAscentAuction {
+    enum LotState { Active, Settled, Canceled }
+
+    struct AuctionLot {
+        address payable seller;
+        uint256 reservePrice;
+        uint256 highestBid;
+        address payable highestBidder;
+        uint256 endTime;
+        LotState state;
+        bytes32 itemHash;
+    }
+
+    address payable public immutable auctioneer;
+    string public marketDescriptor;
+    uint256 public platformFeeBps; // 200 = 2%
+    uint256 public lotCounter;
+    uint256 public accumulatedFees;
+
+    mapping(uint256 => AuctionLot) public lots;
+    mapping(uint256 => mapping(address => uint256)) public pendingReturns;
+
+    event AuctionStarted(uint256 indexed lotId, address indexed seller, uint256 reservePrice, uint256 endTime);
+    event BidPlaced(uint256 indexed lotId, address indexed bidder, uint256 amount);
+    event AuctionSettled(uint256 indexed lotId, address indexed winner, uint256 amount);
+    event AuctionCanceled(uint256 indexed lotId);
+    event OverbidRefunded(uint256 indexed lotId, address indexed bidder, uint256 amount);
+    event FeesHarvested(address indexed auctioneer, uint256 amount);
+    event FeeCutUpdated(uint256 newFeeBps);
+    event DescriptorChanged(string newDescriptor);
+
+    modifier onlyAuctioneer() {
+        require(msg.sender == auctioneer, "ApexAuction: Access denied");
+        _;
+    }
+
+    constructor() {
+        auctioneer = payable(msg.sender);
+        marketDescriptor = "Apex Base English Ascent Auction Core v1";
+        platformFeeBps = 200; // 2%
+    }
+
+    // 1. cancelAuction
+    function cancelAuction(uint256 lotId) external {
+        AuctionLot storage lot = lots[lotId];
+        require(lotId > 0 && lotId <= lotCounter, "ApexAuction: Invalid lot ID");
+        require(lot.seller == msg.sender || msg.sender == auctioneer, "ApexAuction: Unauthorized");
+        require(lot.state == LotState.Active, "ApexAuction: Not active");
+
+        lot.state = LotState.Canceled;
+        uint256 refund = lot.highestBid;
+        address payable refundee = lot.highestBidder;
+
+        lot.highestBid = 0;
+        lot.highestBidder = payable(address(0));
+
+        if (refund > 0 && refundee != address(0)) {
+            (bool sent, ) = refundee.call{value: refund}("");
+            require(sent, "ApexAuction: Refund failed");
+        }
+
+        emit AuctionCanceled(lotId);
+    }
+
+    // 2. createAuctionLot
+    function createAuctionLot(
+        uint256 reservePrice,
+        uint256 durationSeconds,
+        bytes32 itemHash
+    ) external returns (uint256) {
+        require(durationSeconds >= 60, "ApexAuction: Min duration 60s");
+
+        lotCounter++;
+        lots[lotCounter] = AuctionLot({
+            seller: payable(msg.sender),
+            reservePrice: reservePrice,
+            highestBid: 0,
+            highestBidder: payable(address(0)),
+            endTime: block.timestamp + durationSeconds,
+            state: LotState.Active,
+            itemHash: itemHash
+        });
+
+        emit AuctionStarted(lotCounter, msg.sender, reservePrice, block.timestamp + durationSeconds);
+        return lotCounter;
+    }
+
+    // 3. finalizeAuctionLot
+    function finalizeAuctionLot(uint256 lotId) external {
+        AuctionLot storage lot = lots[lotId];
+        require(lotId > 0 && lotId <= lotCounter, "ApexAuction: Invalid lot ID");
+        require(lot.state == LotState.Active, "ApexAuction: Not active");
+
+        lot.state = LotState.Settled;
+        uint256 totalPayout = lot.highestBid;
+
+        if (totalPayout > 0) {
+            uint256 fee = (totalPayout * platformFeeBps) / 10000;
+            uint256 netSellerAmount = totalPayout - fee;
+            accumulatedFees += fee;
+
+            (bool sent, ) = lot.seller.call{value: netSellerAmount}("");
+            require(sent, "ApexAuction: Seller payout failed");
+        }
+
+        emit AuctionSettled(lotId, lot.highestBidder, totalPayout);
+    }
+
+    // 4. harvestPlatformFees
+    function harvestPlatformFees() external onlyAuctioneer {
+        uint256 fees = accumulatedFees;
+        require(fees > 0, "ApexAuction: Zero fees");
+
+        accumulatedFees = 0;
+        (bool sent, ) = auctioneer.call{value: fees}("");
+        require(sent, "ApexAuction: Harvest failed");
+
+        emit FeesHarvested(auctioneer, fees);
+    }
+
+    // 5. placeBid
+    function placeBid(uint256 lotId) external payable {
+        AuctionLot storage lot = lots[lotId];
+        require(lotId > 0 && lotId <= lotCounter, "ApexAuction: Invalid ID");
+        require(lot.state == LotState.Active, "ApexAuction: Not active");
+        require(block.timestamp < lot.endTime, "ApexAuction: Auction ended");
+        require(msg.value > lot.highestBid && msg.value >= lot.reservePrice, "ApexAuction: Bid too low");
+
+        if (lot.highestBidder != address(0)) {
+            pendingReturns[lotId][lot.highestBidder] += lot.highestBid;
+        }
+
+        lot.highestBid = msg.value;
+        lot.highestBidder = payable(msg.sender);
+
+        emit BidPlaced(lotId, msg.sender, msg.value);
+    }
+
+    // 6. reclaimOverbid
+    function reclaimOverbid(uint256 lotId) external {
+        uint256 amount = pendingReturns[lotId][msg.sender];
+        require(amount > 0, "ApexAuction: No funds to reclaim");
+
+        pendingReturns[lotId][msg.sender] = 0;
+        (bool sent, ) = payable(msg.sender).call{value: amount}("");
+        require(sent, "ApexAuction: Reclaim failed");
+
+        emit OverbidRefunded(lotId, msg.sender, amount);
+    }
+
+    // 7. updateFeeCut
+    function updateFeeCut(uint256 newFeeBps) external onlyAuctioneer {
+        require(newFeeBps <= 1000, "ApexAuction: Max fee 10%");
+        platformFeeBps = newFeeBps;
+        emit FeeCutUpdated(newFeeBps);
+    }
+
+    // 8. updateMarketDescriptor
+    function updateMarketDescriptor(string calldata newDescriptor) external onlyAuctioneer {
+        require(bytes(newDescriptor).length > 0, "ApexAuction: Empty descriptor");
+        marketDescriptor = newDescriptor;
+        emit DescriptorChanged(newDescriptor);
+    }
+
+    // Чтение информации о лоте
+    function getLotDetails(uint256 lotId) external view returns (
+        address seller,
+        uint256 reservePrice,
+        uint256 highestBid,
+        address highestBidder,
+        uint256 endTime,
+        LotState state
+    ) {
+        AuctionLot memory lot = lots[lotId];
+        return (lot.seller, lot.reservePrice, lot.highestBid, lot.highestBidder, lot.endTime, lot.state);
+    }
+}
